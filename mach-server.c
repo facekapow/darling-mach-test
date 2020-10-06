@@ -3,24 +3,41 @@
 #include <stdio.h>
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
-#include <sys/event.h>
 #include <errno.h>
+#include <dispatch/dispatch.h>
+#include <dispatch/private.h>
 
 #define MACH_TEST_SERVICE_SERVER 1
 #include "mach-service.h"
 
 #define MAX_EVENTS_PER_CALL 1
 
+void handle_mach_messages(void* context, dispatch_mach_reason_t reason, dispatch_mach_msg_t dmessage, mach_error_t error) {
+	switch (reason) {
+		case DISPATCH_MACH_CONNECTED: {
+			log_msg("channel connected");
+		} break;
+
+		case DISPATCH_MACH_MESSAGE_RECEIVED: {
+			log_msg("got a message");
+
+			size_t size;
+			mach_test_service_message_t* message;
+
+			message = (mach_test_service_message_t*)dispatch_mach_msg_get_msg(dmessage, &size);
+
+			log_msg("got a message with text=%s", message->text);
+
+			mach_msg_destroy((mach_msg_header_t*)message);
+		} break;
+	}
+};
+
 int main(int argc, char** argv) {
 	mach_port_name_t server_port;
 	int result;
-	int kq;
-	struct kevent_qos_s request = {
-		.ident  = 0, // set later
-		.filter = EVFILT_MACHPORT,
-		.flags  = EV_ADD | EV_ENABLE,
-	};
-	struct kevent_qos_s events[MAX_EVENTS_PER_CALL] = {0};
+	dispatch_workloop_t workloop;
+	dispatch_mach_t mach_channel;
 
 	log_msg("trying to get a Mach port...");
 	result = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server_port);
@@ -29,7 +46,6 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	log_msg("got port %d from mach_port_allocate() (with a receive right)", server_port);
-	request.ident = server_port;
 
 	log_msg("grabbing a send right to our port...");
 	result = mach_port_insert_right(mach_task_self(), server_port, server_port, MACH_MSG_TYPE_MAKE_SEND);
@@ -39,58 +55,31 @@ int main(int argc, char** argv) {
 	}
 	log_msg("got a send right to our port");
 
-	log_msg("telling launchd about ourselves...");
+	log_msg("registering with launchd...");
 	result = bootstrap_register(bootstrap_port, MACH_TEST_SERVICE_NAME, server_port);
 	if (result != KERN_SUCCESS) {
 		log_msg("bootstrap_register() failed with %d", result);
 		return 1;
 	}
+	log_msg("successfully registered with launchd");
 
-	log_msg("grabbing a kqueue...");
-	kq = kqueue();
-	if (kq < 0) {
-		result = errno;
-		log_msg("kqueue() failed with %d", result);
-		return 1;
-	}
-	log_msg("grabbed kqueue %d", kq);
+	log_msg("creating an inactive workloop...");
+	workloop = dispatch_workloop_create_inactive("org.darlinghq.mach-test.main");
+	dispatch_set_qos_class_fallback(workloop, QOS_CLASS_UTILITY);
+	dispatch_activate(workloop);
+	log_msg("actived workloop %p", workloop);
 
-	log_msg("queueing up the desired events...");
-	result = kevent_qos(kq, &request, 1, NULL, 0, NULL, NULL, 0);
-	if (result < 0) {
-		result = errno;
-		log_msg("kevent_qos() failed with %d", result);
-		return 1;
-	}
-	log_msg("queued up an EVFILT_MACHPORT listener successfully");
+	log_msg("creating mach channel...");
+	mach_channel = dispatch_mach_create_f("org.darlinghq.mach-test.channel", workloop, NULL, handle_mach_messages);
+	dispatch_set_qos_class_fallback(mach_channel, QOS_CLASS_BACKGROUND);
+	log_msg("created mach channel %p", mach_channel);
 
-	while (1) {
-		log_msg("waiting for events...");
-		result = kevent_qos(kq, NULL, 0, events, sizeof(events) / sizeof(*events), NULL, NULL, 0);
-		if (result < 0) {
-			result = errno;
-			log_msg("kevent_qos() failed with %d", result);
-			return 1;
-		}
-		log_msg("got %d event(s)", result);
+	log_msg("attaching server port to mach channel...");
+	dispatch_mach_connect(mach_channel, server_port, MACH_PORT_NULL, NULL);
+	log_msg("attached server port to mach channel");
 
-		for (int i = 0; i < result; ++i) {
-			struct kevent_qos_s* event = &events[i];
-
-			log_msg("event #%d: ident=%llu, filter=%d", i, event->ident, event->filter);
-
-			if (event->ident == server_port && event->filter == EVFILT_MACHPORT) {
-				mach_test_service_message_t message = {0};
-
-				result = mach_msg(&message.header, MACH_RCV_MSG, 0, sizeof(message), server_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-				if (result != KERN_SUCCESS) {
-					log_msg("mach_msg() failed with %d", result);
-					return 1;
-				}
-				log_msg("got a message with text=%s", message.text);
-			}
-		}
-	}
+	log_msg("handing off to libdispatch via dispatch_main()...");
+	dispatch_main();
 
 	return 0;
 };
