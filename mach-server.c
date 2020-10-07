@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
 		.flags  = EV_ADD | EV_ENABLE,
 	};
 	struct kevent_qos_s events[MAX_EVENTS_PER_CALL] = {0};
+	size_t message_count = 0;
 
 	log_msg("trying to get a Mach port...");
 	result = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server_port);
@@ -39,12 +40,13 @@ int main(int argc, char** argv) {
 	}
 	log_msg("got a send right to our port");
 
-	log_msg("telling launchd about ourselves...");
+	log_msg("registering with launchd...");
 	result = bootstrap_register(bootstrap_port, MACH_TEST_SERVICE_NAME, server_port);
 	if (result != KERN_SUCCESS) {
 		log_msg("bootstrap_register() failed with %d", result);
 		return 1;
 	}
+	log_msg("registered with launchd");
 
 	log_msg("grabbing a kqueue...");
 	kq = kqueue();
@@ -87,7 +89,7 @@ int main(int argc, char** argv) {
 					log_msg("mach_msg() failed with %d", result);
 					return 1;
 				}
-				log_msg("got a message with text=%s", message.text);
+				log_msg("got message %zu with text=\"%s\"", message_count++, message.text);
 			}
 		}
 	}
